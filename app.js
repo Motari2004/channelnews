@@ -4,35 +4,35 @@ const fs = require("fs");
 const pino = require("pino");
 const QRCode = require("qrcode"); 
 const express = require("express");
-const path = require("path");
 
 const app = express();
 app.use(express.json()); 
 
 const PORT = process.env.PORT || 3000;
 
-// --- STORAGE CONFIG (Render Optimized) ---
+// --- STORAGE (Optimized for Render /tmp) ---
 const SESSION_FOLDER = "/tmp/watchdog_sessions"; 
 const HISTORY_FILE = "/tmp/posted_news.json";
 
 if (!fs.existsSync(SESSION_FOLDER)) fs.mkdirSync(SESSION_FOLDER, { recursive: true });
 if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, JSON.stringify([]));
 
-// --- BOT SETTINGS ---
+// --- SETTINGS ---
 const API_KEY = "f7da4fb81e024dcba2f28f19ec500cfc"; 
 const CHANNEL_JID = "120363424747900547@newsletter";
 const HEADERS = ["🚨 *BREAKING NEWS*", "🌍 *WORLD UPDATES*", "📡 *GLOBAL FLASH*", "⚡ *QUICK FEED*", "🔥 *NEWS UPDATE*"];
 
-// Global Bot State
+// Global State
 let sock = null;
 let newsQueue = []; 
-let botStatus = "Disconnected"; // "Disconnected", "Connecting", "Active"
+let botStatus = "Disconnected"; 
 let latestQR = null; 
 let postIntervalTime = 10000; 
 let postTimer = null;
 let scanTimer = null;
+let intervalsStarted = false;
 
-// --- BOT LOGIC ---
+// --- CORE LOGIC ---
 async function scanNews() {
     if (botStatus !== "Active") return;
     const yesterday = new Date();
@@ -49,7 +49,7 @@ async function scanNews() {
                 newsQueue.push(article);
             }
         });
-        console.log(`Scan complete. Queue size: ${newsQueue.length}`);
+        console.log(`Scan successful. Queue: ${newsQueue.length}`);
     } catch (e) { console.error("Scan Error:", e.message); }
 }
 
@@ -67,8 +67,8 @@ async function postFromQueue() {
         history.push(article.url);
         fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
     } catch (err) { 
-        console.error("Post Error:", err.message);
-        newsQueue.unshift(article); // Put it back if it failed
+        console.error("Posting failed, returning to queue...");
+        newsQueue.unshift(article); 
     }
 }
 
@@ -80,7 +80,9 @@ async function startBot() {
     sock = makeWASocket({
         auth: state,
         logger: pino({ level: "silent" }),
-        browser: ["Watchdog Pro", "Chrome", "1.0.0"]
+        browser: ["Ubuntu", "Chrome", "110.0.5481.177"],
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -94,37 +96,38 @@ async function startBot() {
         }
 
         if (connection === "open") {
-            console.log("WhatsApp Connected!");
+            console.log("✅ Connected to WhatsApp");
             botStatus = "Active";
             latestQR = null;
             
-            // Start the loops only once connected
-            if (!scanTimer) {
+            if (!intervalsStarted) {
                 scanNews();
-                scanTimer = setInterval(scanNews, 60 * 60 * 1000);
-            }
-            if (!postTimer) {
+                scanTimer = setInterval(scanNews, 60 * 60 * 1000); 
                 postTimer = setInterval(postFromQueue, postIntervalTime);
+                intervalsStarted = true;
             }
         }
 
         if (connection === "close") {
-            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
             botStatus = "Disconnected";
-            console.log("Connection closed. Reconnecting:", shouldReconnect);
+            const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             
+            console.log(`Connection closed [${statusCode}]. Reconnecting: ${shouldReconnect}`);
+
             if (shouldReconnect) {
-                startBot();
+                // 5-second delay to prevent Render loop spam
+                setTimeout(() => startBot(), 5000);
             } else {
-                // If logged out, clear session and force fresh QR
+                console.log("Session logged out. Wiping credentials...");
                 fs.rmSync(SESSION_FOLDER, { recursive: true, force: true });
-                startBot();
+                setTimeout(() => startBot(), 5000);
             }
         }
     });
 }
 
-// --- WEB API ---
+// --- API ENDPOINTS ---
 app.get('/api/stats', (req, res) => {
     res.json({
         posted: (JSON.parse(fs.readFileSync(HISTORY_FILE))).length,
@@ -137,111 +140,90 @@ app.get('/api/stats', (req, res) => {
 
 app.post('/api/set-interval', (req, res) => {
     const { seconds } = req.body;
-    if (postTimer) clearInterval(postTimer);
+    clearInterval(postTimer);
     postIntervalTime = seconds * 1000;
     postTimer = setInterval(postFromQueue, postIntervalTime);
     res.json({ success: true });
 });
 
-// --- UI DASHBOARD ---
+// --- DASHBOARD UI ---
 app.get('/', (req, res) => {
     res.send(`
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Watchdog Pro Setup</title>
         <script src="https://cdn.tailwindcss.com"></script>
-        <title>Watchdog Pro</title>
         <style>
-            body { background: #020617; color: white; font-family: sans-serif; }
-            .glass { background: rgba(15, 23, 42, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.1); }
-            .qr-screen { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #020617; }
+            body { background: #020617; color: white; font-family: ui-sans-serif, system-ui; }
+            .stat-card { background: #0f172a; border: 1px solid rgba(255,255,255,0.05); }
+            .qr-overlay { background: #020617; position: fixed; inset: 0; z-index: 50; display: flex; flex-direction: column; align-items: center; justify-content: center; }
         </style>
     </head>
-    <body class="flex items-center justify-center min-h-screen p-4">
-
-        <div id="qrScreen" class="qr-screen">
-            <h1 class="text-4xl font-black tracking-tighter mb-2 text-blue-500">WATCHDOG PRO</h1>
-            <p class="text-slate-500 text-[10px] uppercase tracking-[0.3em] mb-12">System Authentication Required</p>
+    <body class="p-4">
+        <div id="qrOverlay" class="qr-overlay">
+            <h1 class="text-4xl font-black text-blue-500 mb-2 tracking-tighter">WATCHDOG PRO</h1>
+            <p class="text-slate-500 text-xs font-mono mb-10 uppercase tracking-widest">Initial Connection Required</p>
             
-            <div class="glass p-8 rounded-[3rem] border-2 border-blue-500/20 text-center shadow-2xl">
-                <div id="qrLoader" class="w-56 h-56 flex items-center justify-center italic text-slate-600 text-sm">
-                    Starting Engine...
-                </div>
-                <img id="qrImg" class="hidden w-56 h-56 bg-white p-3 rounded-3xl mx-auto shadow-inner" />
-                <div class="mt-8">
-                    <p class="text-blue-400 font-bold text-xs uppercase tracking-widest animate-pulse">Scan to Connect</p>
-                </div>
+            <div id="qrContainer" class="stat-card p-6 rounded-[3rem] border-2 border-blue-500/30 text-center">
+                <div id="qrLoader" class="w-48 h-48 flex items-center justify-center italic text-slate-600">Generating QR...</div>
+                <img id="qrImg" class="hidden w-48 h-48 bg-white p-2 rounded-2xl mx-auto shadow-2xl" />
+                <p class="text-[10px] text-blue-400 font-bold mt-6 uppercase tracking-widest">Scan with WhatsApp</p>
             </div>
+            <p class="mt-8 text-[9px] text-slate-600 uppercase tracking-[0.4em]">Waiting for system handshake</p>
         </div>
 
-        <div id="mainApp" class="hidden w-full max-w-sm">
-            <header class="text-center mb-10">
-                <h1 class="text-3xl font-black italic text-blue-500">WATCHDOG<span class="text-white">.</span></h1>
-                <div class="inline-block mt-2 px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full">
-                    <p class="text-[9px] text-green-500 font-bold uppercase tracking-widest">● System Live</p>
-                </div>
+        <div id="mainDashboard" class="hidden max-w-sm mx-auto mt-10">
+            <header class="text-center mb-8">
+                <h1 class="text-2xl font-black text-blue-500 uppercase tracking-tighter italic">Watchdog Active</h1>
+                <p class="text-[10px] text-green-500 font-mono animate-pulse uppercase">● Connected</p>
             </header>
 
             <div class="grid grid-cols-2 gap-4 mb-6">
-                <div class="glass p-6 rounded-3xl text-center">
-                    <p class="text-slate-500 text-[9px] font-black uppercase mb-1">Articles Posted</p>
-                    <h2 id="postCount" class="text-4xl font-black">0</h2>
+                <div class="stat-card p-6 rounded-3xl text-center">
+                    <p class="text-slate-500 text-[9px] uppercase font-black mb-1">Posted</p>
+                    <h2 id="postedCount" class="text-4xl font-black">0</h2>
                 </div>
-                <div class="glass p-6 rounded-3xl text-center">
-                    <p class="text-blue-500 text-[9px] font-black uppercase mb-1">In Queue</p>
+                <div class="stat-card p-6 rounded-3xl text-center">
+                    <p class="text-orange-500 text-[9px] uppercase font-black mb-1">Queue</p>
                     <h2 id="queueCount" class="text-4xl font-black">0</h2>
                 </div>
             </div>
 
-            <div class="glass p-6 rounded-[2rem]">
-                <div class="flex justify-between items-center mb-4">
-                    <p class="text-[10px] font-black uppercase text-slate-400">Post Interval</p>
-                    <span id="intDisplay" class="text-blue-500 font-bold">10s</span>
-                </div>
-                <input type="range" min="5" max="300" value="10" 
-                    class="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
-                    oninput="document.getElementById('intDisplay').innerText = this.value + 's'"
-                    onchange="updateInterval(this.value)">
+            <div class="stat-card p-6 rounded-[2rem] mb-6">
+                <p class="text-slate-500 text-[10px] uppercase font-black mb-4">Post Interval: <span id="intervalVal" class="text-blue-500">10s</span></p>
+                <input type="range" min="5" max="600" value="10" class="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer"
+                    oninput="document.getElementById('intervalVal').innerText = this.value + 's'"
+                    onchange="fetch('/api/set-interval', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({seconds:parseInt(this.value)})})">
             </div>
         </div>
 
         <script>
-            async function updateInterval(val) {
-                await fetch('/api/set-interval', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({seconds: parseInt(val)})
-                });
-            }
-
-            async function sync() {
+            async function refresh() {
                 try {
                     const res = await fetch('/api/stats');
                     const data = await res.json();
-
-                    if (data.status === "Active") {
-                        document.getElementById('qrScreen').classList.add('hidden');
-                        document.getElementById('mainApp').classList.remove('hidden');
-                        document.getElementById('postCount').innerText = data.posted;
+                    
+                    if (data.status === 'Active') {
+                        document.getElementById('qrOverlay').classList.add('hidden');
+                        document.getElementById('mainDashboard').classList.remove('hidden');
+                        document.getElementById('postedCount').innerText = data.posted;
                         document.getElementById('queueCount').innerText = data.queue;
                     } else {
-                        document.getElementById('qrScreen').classList.remove('hidden');
-                        document.getElementById('mainApp').classList.add('hidden');
+                        document.getElementById('qrOverlay').classList.remove('hidden');
+                        document.getElementById('mainDashboard').classList.add('hidden');
                         if (data.qr) {
                             document.getElementById('qrLoader').classList.add('hidden');
                             const img = document.getElementById('qrImg');
                             img.classList.remove('hidden');
                             img.src = data.qr;
-                        } else {
-                            document.getElementById('qrLoader').innerText = "Generating Handshake...";
                         }
                     }
-                } catch(e) {}
+                } catch(e){}
             }
-
-            setInterval(sync, 3000);
-            sync();
+            setInterval(refresh, 3000);
+            refresh();
         </script>
     </body>
     </html>
