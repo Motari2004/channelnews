@@ -1,234 +1,252 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, jidNormalizedUser } = require("@whiskeysockets/baileys");
-const http = require("http");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require("@whiskeysockets/baileys");
+const axios = require("axios");
 const fs = require("fs");
 const pino = require("pino");
-const QRCode = require("qrcode");
+const QRCode = require("qrcode"); 
+const express = require("express");
 const path = require("path");
 
-// --- CONFIGURATION ---
+const app = express();
+app.use(express.json()); 
+
 const PORT = process.env.PORT || 3000;
-const isProduction = process.env.RENDER || process.env.NODE_ENV === 'production';
-const BASE_SESSION_DIR = isProduction ? '/tmp/scorpio_sessions' : path.join(__dirname, 'sessions');
-const DB_PATH = path.join(BASE_SESSION_DIR, 'user_creds.json');
-const TRIAL_DURATION = 5 * 24 * 60 * 60 * 1000; 
-const ADMIN_CREDENTIALS = { u: "Motari2004", p: "Hopefrey2004" };
 
-// Ensure directories
-if (!fs.existsSync(BASE_SESSION_DIR)) fs.mkdirSync(BASE_SESSION_DIR, { recursive: true });
-if (!fs.existsSync(DB_PATH)) fs.writeFileSync(DB_PATH, JSON.stringify({}));
+// --- STORAGE CONFIG (Render Optimized) ---
+const SESSION_FOLDER = "/tmp/watchdog_sessions"; 
+const HISTORY_FILE = "/tmp/posted_news.json";
 
-const sessions = new Map();
+if (!fs.existsSync(SESSION_FOLDER)) fs.mkdirSync(SESSION_FOLDER, { recursive: true });
+if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, JSON.stringify([]));
 
-function getDb() {
-    try { return JSON.parse(fs.readFileSync(DB_PATH, 'utf-8')); }
-    catch (e) { return {}; }
+// --- BOT SETTINGS ---
+const API_KEY = "f7da4fb81e024dcba2f28f19ec500cfc"; 
+const CHANNEL_JID = "120363424747900547@newsletter";
+const HEADERS = ["🚨 *BREAKING NEWS*", "🌍 *WORLD UPDATES*", "📡 *GLOBAL FLASH*", "⚡ *QUICK FEED*", "🔥 *NEWS UPDATE*"];
+
+// Global Bot State
+let sock = null;
+let newsQueue = []; 
+let botStatus = "Disconnected"; // "Disconnected", "Connecting", "Active"
+let latestQR = null; 
+let postIntervalTime = 10000; 
+let postTimer = null;
+let scanTimer = null;
+
+// --- BOT LOGIC ---
+async function scanNews() {
+    if (botStatus !== "Active") return;
+    const yesterday = new Date();
+    yesterday.setHours(yesterday.getHours() - 24);
+    const url = `https://newsapi.org/v2/everything?q=world&from=${yesterday.toISOString().split('T')[0]}&sortBy=publishedAt&language=en&apiKey=${API_KEY}`;
+    
+    try {
+        const { data } = await axios.get(url);
+        if (data.status !== "ok") return;
+        
+        let history = JSON.parse(fs.readFileSync(HISTORY_FILE));
+        data.articles.forEach(article => {
+            if (article.url && !history.includes(article.url) && !newsQueue.some(a => a.url === article.url)) {
+                newsQueue.push(article);
+            }
+        });
+        console.log(`Scan complete. Queue size: ${newsQueue.length}`);
+    } catch (e) { console.error("Scan Error:", e.message); }
 }
 
-async function startSession(sessionId) {
-    if (sessions.has(sessionId)) {
-        const existing = sessions.get(sessionId);
-        if (existing.sock || existing.initializing) return;
+async function postFromQueue() {
+    if (botStatus !== "Active" || newsQueue.length === 0 || !sock) return;
+    
+    const article = newsQueue.shift();
+    const header = HEADERS[Math.floor(Math.random() * HEADERS.length)];
+    
+    try {
+        const message = `${header}\n\n📰 *${article.title.toUpperCase()}*\n\n${article.description || ""}\n\n🔗 ${article.url}\n\n📡 _Source: ${article.source.name}_`;
+        await sock.sendMessage(CHANNEL_JID, { text: message });
+        
+        let history = JSON.parse(fs.readFileSync(HISTORY_FILE));
+        history.push(article.url);
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
+    } catch (err) { 
+        console.error("Post Error:", err.message);
+        newsQueue.unshift(article); // Put it back if it failed
     }
+}
 
-    sessions.set(sessionId, {
-        connected: false, qr: null, views: 0, emoji: "none",
-        active: true, phoneNumber: null, sock: null, initializing: true
+// --- BOT STARTUP ---
+async function startBot() {
+    botStatus = "Connecting";
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_FOLDER);
+    
+    sock = makeWASocket({
+        auth: state,
+        logger: pino({ level: "silent" }),
+        browser: ["Watchdog Pro", "Chrome", "1.0.0"]
     });
 
-    const session = sessions.get(sessionId);
-    const sessionFolder = path.join(BASE_SESSION_DIR, sessionId);
-    if (!fs.existsSync(sessionFolder)) fs.mkdirSync(sessionFolder, { recursive: true });
+    sock.ev.on("creds.update", saveCreds);
 
-    try {
-        const { state, saveCreds } = await useMultiFileAuthState(sessionFolder);
-        const sock = makeWASocket({
-            auth: state,
-            logger: pino({ level: 'silent' }),
-            browser: ["Scorpio Engine", "Chrome", "1.0.0"],
-            printQRInTerminal: true // Good for Render logs backup
-        });
+    sock.ev.on("connection.update", async (update) => {
+        const { connection, qr, lastDisconnect } = update;
 
-        session.sock = sock;
-        session.initializing = false;
+        if (qr) {
+            console.log("New QR Generated");
+            latestQR = await QRCode.toDataURL(qr);
+        }
 
-        sock.ev.on('creds.update', saveCreds);
-
-        sock.ev.on('connection.update', async (update) => {
-            const { connection, lastDisconnect, qr } = update;
-
-            if (qr) {
-                console.log(`[${sessionId}] QR Generated`);
-                session.qr = await QRCode.toDataURL(qr);
+        if (connection === "open") {
+            console.log("WhatsApp Connected!");
+            botStatus = "Active";
+            latestQR = null;
+            
+            // Start the loops only once connected
+            if (!scanTimer) {
+                scanNews();
+                scanTimer = setInterval(scanNews, 60 * 60 * 1000);
             }
-
-            if (connection === 'open') {
-                console.log(`[${sessionId}] Connected`);
-                session.connected = true;
-                session.qr = null;
-                session.phoneNumber = jidNormalizedUser(sock.user.id).split('@')[0];
-                
-                const db = getDb();
-                if (!db[session.phoneNumber]) {
-                    db[session.phoneNumber] = {
-                        phone: session.phoneNumber,
-                        sid: sessionId,
-                        views: 0,
-                        startDate: Date.now(),
-                        isPremium: false,
-                        createdAt: Date.now(),
-                    };
-                    fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
-                }
+            if (!postTimer) {
+                postTimer = setInterval(postFromQueue, postIntervalTime);
             }
+        }
 
-            if (connection === 'close') {
-                session.connected = false;
-                const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
-                if (shouldReconnect) {
-                    session.sock = null;
-                    setTimeout(() => startSession(sessionId), 5000);
-                } else {
-                    sessions.delete(sessionId);
-                    if (fs.existsSync(sessionFolder)) fs.rmSync(sessionFolder, { recursive: true, force: true });
-                }
+        if (connection === "close") {
+            const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
+            botStatus = "Disconnected";
+            console.log("Connection closed. Reconnecting:", shouldReconnect);
+            
+            if (shouldReconnect) {
+                startBot();
+            } else {
+                // If logged out, clear session and force fresh QR
+                fs.rmSync(SESSION_FOLDER, { recursive: true, force: true });
+                startBot();
             }
-        });
-
-        // --- Status Auto-Viewer Logic ---
-        sock.ev.on("messages.upsert", async ({ messages }) => {
-            const phone = session.phoneNumber;
-            if (!phone || !session.active || !session.connected) return;
-
-            const db = getDb();
-            const user = db[phone];
-            if (!user) return;
-
-            // Check expiry
-            if (!user.isPremium && (Date.now() - user.startDate > TRIAL_DURATION)) {
-                session.active = false;
-                return;
-            }
-
-            for (const msg of messages) {
-                if (msg.key.remoteJid === "status@broadcast" && !msg.key.fromMe) {
-                    const participant = msg.key.participant || msg.participant;
-                    
-                    // Simple instant delay for free, random for premium
-                    let delay = user.isPremium ? Math.floor(Math.random() * 10000) + 2000 : 0;
-
-                    setTimeout(async () => {
-                        try {
-                            await sock.sendReceipt("status@broadcast", participant, [msg.key.id], "read");
-                            user.views = (user.views || 0) + 1;
-                            db[phone] = user;
-                            fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
-                            
-                            if (session.emoji !== "none") {
-                                await sock.sendMessage("status@broadcast", {
-                                    react: { text: session.emoji, key: msg.key }
-                                }, { statusJidList: [participant] });
-                            }
-                        } catch (e) {}
-                    }, delay);
-                }
-            }
-        });
-
-    } catch (err) {
-        session.initializing = false;
-        console.error("StartSession Error:", err);
-    }
+        }
+    });
 }
 
-// --- HTTP SERVER ---
-const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const sessionId = url.searchParams.get("sid") || "default-scorpio";
-
-    // API Status Endpoint (Used by Frontend)
-    if (url.pathname === "/api/status") {
-        if (!sessions.has(sessionId)) await startSession(sessionId);
-        const s = sessions.get(sessionId);
-        const db = getDb();
-        const user = s.phoneNumber ? db[s.phoneNumber] : {};
-
-        res.writeHead(200, { "Content-Type": "application/json" });
-        return res.end(JSON.stringify({
-            connected: s.connected,
-            qr: s.qr, // Send the QR back to the frontend
-            views: user.views || 0,
-            emoji: s.emoji,
-            active: s.active,
-            phoneNumber: s.phoneNumber,
-            isPremium: !!user.isPremium
-        }));
-    }
-
-    // Serving the HTML
-    if (url.pathname === "/") {
-        res.writeHead(200, { "Content-Type": "text/html" });
-        return res.end(getHtmlContent(sessionId));
-    }
-
-    res.writeHead(404);
-    res.end("Not Found");
+// --- WEB API ---
+app.get('/api/stats', (req, res) => {
+    res.json({
+        posted: (JSON.parse(fs.readFileSync(HISTORY_FILE))).length,
+        queue: newsQueue.length,
+        status: botStatus,
+        interval: postIntervalTime / 1000,
+        qr: latestQR
+    });
 });
 
-function getHtmlContent(sid) {
-    return `
+app.post('/api/set-interval', (req, res) => {
+    const { seconds } = req.body;
+    if (postTimer) clearInterval(postTimer);
+    postIntervalTime = seconds * 1000;
+    postTimer = setInterval(postFromQueue, postIntervalTime);
+    res.json({ success: true });
+});
+
+// --- UI DASHBOARD ---
+app.get('/', (req, res) => {
+    res.send(`
     <!DOCTYPE html>
     <html lang="en">
     <head>
         <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
         <script src="https://cdn.tailwindcss.com"></script>
-        <title>Scorpio Engine</title>
-        <style>body { background: #020617; color: white; }</style>
+        <title>Watchdog Pro</title>
+        <style>
+            body { background: #020617; color: white; font-family: sans-serif; }
+            .glass { background: rgba(15, 23, 42, 0.8); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.1); }
+            .qr-screen { position: fixed; inset: 0; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #020617; }
+        </style>
     </head>
-    <body class="flex flex-col items-center justify-center min-h-screen p-4">
-        <div class="bg-slate-900 p-10 rounded-[3rem] border border-white/10 w-full max-w-sm text-center">
-            <h1 class="text-4xl font-black italic mb-8">SCORPIO<span class="text-orange-500">.</span></h1>
+    <body class="flex items-center justify-center min-h-screen p-4">
 
-            <div id="qr-view" class="space-y-4">
-                <div id="qr-container" class="bg-white p-2 rounded-2xl inline-block shadow-2xl">
-                    <div id="loader" class="w-48 h-48 flex items-center justify-center text-slate-400 italic text-xs">Generating QR...</div>
-                    <img id="qr-img" class="hidden w-48 h-48" />
+        <div id="qrScreen" class="qr-screen">
+            <h1 class="text-4xl font-black tracking-tighter mb-2 text-blue-500">WATCHDOG PRO</h1>
+            <p class="text-slate-500 text-[10px] uppercase tracking-[0.3em] mb-12">System Authentication Required</p>
+            
+            <div class="glass p-8 rounded-[3rem] border-2 border-blue-500/20 text-center shadow-2xl">
+                <div id="qrLoader" class="w-56 h-56 flex items-center justify-center italic text-slate-600 text-sm">
+                    Starting Engine...
                 </div>
-                <p class="text-[10px] uppercase font-bold text-slate-500 tracking-widest">Link WhatsApp to Start</p>
+                <img id="qrImg" class="hidden w-56 h-56 bg-white p-3 rounded-3xl mx-auto shadow-inner" />
+                <div class="mt-8">
+                    <p class="text-blue-400 font-bold text-xs uppercase tracking-widest animate-pulse">Scan to Connect</p>
+                </div>
+            </div>
+        </div>
+
+        <div id="mainApp" class="hidden w-full max-w-sm">
+            <header class="text-center mb-10">
+                <h1 class="text-3xl font-black italic text-blue-500">WATCHDOG<span class="text-white">.</span></h1>
+                <div class="inline-block mt-2 px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full">
+                    <p class="text-[9px] text-green-500 font-bold uppercase tracking-widest">● System Live</p>
+                </div>
+            </header>
+
+            <div class="grid grid-cols-2 gap-4 mb-6">
+                <div class="glass p-6 rounded-3xl text-center">
+                    <p class="text-slate-500 text-[9px] font-black uppercase mb-1">Articles Posted</p>
+                    <h2 id="postCount" class="text-4xl font-black">0</h2>
+                </div>
+                <div class="glass p-6 rounded-3xl text-center">
+                    <p class="text-blue-500 text-[9px] font-black uppercase mb-1">In Queue</p>
+                    <h2 id="queueCount" class="text-4xl font-black">0</h2>
+                </div>
             </div>
 
-            <div id="dash-view" class="hidden space-y-4">
-                <div class="bg-slate-950 p-4 rounded-2xl border border-white/5">
-                    <p class="text-[10px] text-slate-500 uppercase font-black">Total Views</p>
-                    <h2 id="view-count" class="text-4xl font-black text-orange-500">0</h2>
+            <div class="glass p-6 rounded-[2rem]">
+                <div class="flex justify-between items-center mb-4">
+                    <p class="text-[10px] font-black uppercase text-slate-400">Post Interval</p>
+                    <span id="intDisplay" class="text-blue-500 font-bold">10s</span>
                 </div>
-                <button class="w-full bg-orange-600 py-4 rounded-2xl font-black uppercase tracking-widest">Engine Active</button>
+                <input type="range" min="5" max="300" value="10" 
+                    class="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
+                    oninput="document.getElementById('intDisplay').innerText = this.value + 's'"
+                    onchange="updateInterval(this.value)">
             </div>
         </div>
 
         <script>
-            const sid = "${sid}";
-            async function checkStatus() {
-                try {
-                    const r = await fetch("/api/status?sid=" + sid);
-                    const data = await r.json();
-
-                    if (data.connected) {
-                        document.getElementById('qr-view').classList.add('hidden');
-                        document.getElementById('dash-view').classList.remove('hidden');
-                        document.getElementById('view-count').innerText = data.views;
-                    } else if (data.qr) {
-                        document.getElementById('loader').classList.add('hidden');
-                        const img = document.getElementById('qr-img');
-                        img.classList.remove('hidden');
-                        img.src = data.qr;
-                    }
-                } catch (e) { console.log("Status error", e); }
+            async function updateInterval(val) {
+                await fetch('/api/set-interval', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({seconds: parseInt(val)})
+                });
             }
-            setInterval(checkStatus, 3000);
-            checkStatus();
+
+            async function sync() {
+                try {
+                    const res = await fetch('/api/stats');
+                    const data = await res.json();
+
+                    if (data.status === "Active") {
+                        document.getElementById('qrScreen').classList.add('hidden');
+                        document.getElementById('mainApp').classList.remove('hidden');
+                        document.getElementById('postCount').innerText = data.posted;
+                        document.getElementById('queueCount').innerText = data.queue;
+                    } else {
+                        document.getElementById('qrScreen').classList.remove('hidden');
+                        document.getElementById('mainApp').classList.add('hidden');
+                        if (data.qr) {
+                            document.getElementById('qrLoader').classList.add('hidden');
+                            const img = document.getElementById('qrImg');
+                            img.classList.remove('hidden');
+                            img.src = data.qr;
+                        } else {
+                            document.getElementById('qrLoader').innerText = "Generating Handshake...";
+                        }
+                    }
+                } catch(e) {}
+            }
+
+            setInterval(sync, 3000);
+            sync();
         </script>
     </body>
-    </html>`;
-}
+    </html>
+    `);
+});
 
-server.listen(PORT, () => console.log(`Scorpio Online: ${PORT}`));
+startBot();
+app.listen(PORT, '0.0.0.0', () => console.log(`Watchdog Hub Online: ${PORT}`));
