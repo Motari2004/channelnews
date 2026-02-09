@@ -4,7 +4,7 @@ const fs = require("fs");
 const pino = require("pino");
 const QRCode = require("qrcode"); 
 const express = require("express");
-const crypto = require("crypto"); // Added for unique session IDs
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json()); 
@@ -31,13 +31,13 @@ let postIntervalTime = 10000;
 let postTimer = null;
 let scanTimer = null;
 let intervalsStarted = false;
+let retryCount = 0;
 
-// --- BOT STARTUP ---
+// --- BOT STARTUP (COMPATIBILITY MODE) ---
 async function startBot() {
     botStatus = "Connecting";
-    console.log(`[INIT] Starting session: ${currentSessionID}`);
+    console.log(`[INIT] Booting Session: ${currentSessionID} | Attempt: ${retryCount + 1}`);
     
-    // Ensure clean directory
     if (!fs.existsSync(SESSION_FOLDER)) fs.mkdirSync(SESSION_FOLDER, { recursive: true });
 
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_FOLDER);
@@ -45,12 +45,15 @@ async function startBot() {
     sock = makeWASocket({
         auth: state,
         logger: pino({ level: "silent" }),
-        // Adding a randomized device name to bypass 405 filters
-        browser: ["Watchdog Pro", "Chrome", `Node-${currentSessionID}`],
+        // Compatibility Browser String
+        browser: ["Ubuntu", "Chrome", "20.0.04"], 
         syncFullHistory: false,
-        connectTimeoutMs: 60000,
+        markOnlineOnConnect: false, // Critical: Don't flood the socket immediately
+        connectTimeoutMs: 90000,    // Increased for slow cloud networks
         defaultQueryTimeoutMs: 0,
-        keepAliveIntervalMs: 15000,
+        keepAliveIntervalMs: 30000, // Slower heartbeats
+        // Stub to prevent the 405 "Fetch Messages" loop
+        getMessage: async () => { return { conversation: 'Watchdog Pro' } }
     });
 
     sock.ev.on("creds.update", saveCreds);
@@ -59,14 +62,16 @@ async function startBot() {
         const { connection, qr, lastDisconnect } = update;
 
         if (qr) {
-            console.log("[QR] New code ready for scan");
+            console.log("[QR] Handshake ready. Awaiting scan.");
             latestQR = await QRCode.toDataURL(qr);
+            retryCount = 0; // Reset retries if we successfully got a QR
         }
 
         if (connection === "open") {
-            console.log("✅ SUCCESS: Connected to WhatsApp");
+            console.log("✅ CONNECTED: Watchdog Pro is Live.");
             botStatus = "Active";
             latestQR = null;
+            retryCount = 0;
             
             if (!intervalsStarted) {
                 scanNews();
@@ -79,29 +84,30 @@ async function startBot() {
         if (connection === "close") {
             const statusCode = (lastDisconnect?.error)?.output?.statusCode;
             botStatus = "Disconnected";
-            console.log(`[CLOSE] Reason: ${statusCode}`);
+            console.log(`[CLOSE] Connection terminated. Status: ${statusCode}`);
 
-            // If 405 or Logged Out, we MUST change the session ID to force a fresh handshake
+            retryCount++;
+            let waitTime = retryCount > 5 ? 30000 : 5000; // Cool down if failing repeatedly
+
             if (statusCode === 405 || statusCode === DisconnectReason.loggedOut) {
-                console.log("[CRITICAL] Forcing Session Rotation...");
+                console.log("[CRITICAL] 405 Detected. Hard-rotating session...");
                 try { fs.rmSync(SESSION_FOLDER, { recursive: true, force: true }); } catch(e) {}
                 
-                // GENERATE NEW SESSION ID
                 currentSessionID = crypto.randomBytes(4).toString('hex');
                 SESSION_FOLDER = `/tmp/session_${currentSessionID}`;
                 
-                await delay(3000);
+                await delay(waitTime);
                 startBot();
             } else {
-                console.log("[RETRY] Attempting reconnect...");
-                await delay(5000);
+                console.log(`[RETRY] Reconnecting in ${waitTime/1000}s...`);
+                await delay(waitTime);
                 startBot();
             }
         }
     });
 }
 
-// --- CORE LOGIC (SCAN/POST) ---
+// --- NEWS LOGIC ---
 async function scanNews() {
     if (botStatus !== "Active") return;
     const yesterday = new Date();
@@ -116,7 +122,7 @@ async function scanNews() {
                 newsQueue.push(article);
             }
         });
-        console.log(`[NEWS] Queue size: ${newsQueue.length}`);
+        console.log(`[NEWS] Articles in queue: ${newsQueue.length}`);
     } catch (e) { console.error("[NEWS ERR]:", e.message); }
 }
 
@@ -169,32 +175,35 @@ app.get('/', (req, res) => {
     </head>
     <body class="flex items-center justify-center min-h-screen p-6">
         <div id="qrUI" class="text-center">
-            <h1 class="text-4xl font-black text-blue-500 mb-2 tracking-tighter">WATCHDOG PRO</h1>
-            <p id="sessionID" class="text-slate-500 text-[10px] uppercase tracking-widest mb-8 italic"></p>
-            <div class="glass p-8 rounded-[3rem] border-2 border-blue-500/20 inline-block shadow-2xl">
-                <div id="loader" class="w-56 h-56 flex items-center justify-center text-slate-500 animate-pulse text-sm">Initializing...</div>
-                <img id="qrImg" class="hidden w-56 h-56 bg-white p-2 rounded-2xl mx-auto shadow-2xl" />
+            <h1 class="text-4xl font-black text-blue-500 mb-2 tracking-tighter uppercase">Watchdog Pro</h1>
+            <p id="sessionID" class="text-slate-500 text-[9px] uppercase tracking-widest mb-10 font-mono italic"></p>
+            <div class="glass p-8 rounded-[3.5rem] border-2 border-blue-500/10 inline-block shadow-2xl">
+                <div id="loader" class="w-56 h-56 flex items-center justify-center text-slate-500 animate-pulse text-xs tracking-widest uppercase">Securing Handshake...</div>
+                <img id="qrImg" class="hidden w-56 h-56 bg-white p-3 rounded-3xl mx-auto shadow-2xl" />
             </div>
-            <p class="mt-8 text-[10px] text-blue-400 font-bold uppercase tracking-[0.3em]">Scan with WhatsApp</p>
+            <div class="mt-8 flex flex-col items-center gap-2">
+                <p class="text-[10px] text-blue-400 font-bold uppercase tracking-[0.4em]">Scan via Linked Devices</p>
+                <p class="text-[8px] text-slate-600 uppercase">Wait for QR to stabilize</p>
+            </div>
         </div>
 
         <div id="mainUI" class="hidden w-full max-w-sm">
             <header class="text-center mb-10">
-                <h1 class="text-3xl font-black italic text-blue-500">SYSTEM LIVE</h1>
-                <div class="inline-block mt-2 px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full text-[9px] text-green-500 font-bold uppercase tracking-widest">● Broadcast Ready</div>
+                <h1 class="text-3xl font-black italic text-blue-500 tracking-tighter">WATCHDOG ACTIVE</h1>
+                <div class="inline-block mt-2 px-3 py-1 bg-green-500/10 border border-green-500/20 rounded-full text-[9px] text-green-500 font-bold uppercase tracking-widest">● Broadcast Protocol Enabled</div>
             </header>
             <div class="grid grid-cols-2 gap-4 mb-6">
                 <div class="glass p-6 rounded-3xl text-center">
-                    <p class="text-slate-500 text-[9px] font-black uppercase mb-1">Total Posts</p>
+                    <p class="text-slate-500 text-[9px] font-black uppercase mb-1">Articles Sent</p>
                     <h2 id="pCnt" class="text-4xl font-black">0</h2>
                 </div>
                 <div class="glass p-6 rounded-3xl text-center">
-                    <p class="text-blue-500 text-[9px] font-black uppercase mb-1">In Queue</p>
+                    <p class="text-blue-500 text-[9px] font-black uppercase mb-1">Queue Size</p>
                     <h2 id="qCnt" class="text-4xl font-black">0</h2>
                 </div>
             </div>
             <div class="glass p-6 rounded-[2rem]">
-                <p class="text-slate-400 text-[10px] uppercase font-black mb-4 flex justify-between">Interval <span><span id="iVal" class="text-blue-500">10</span>s</span></p>
+                <p class="text-slate-400 text-[10px] uppercase font-black mb-4 flex justify-between">Pulse Rate <span><span id="iVal" class="text-blue-500">10</span>s</span></p>
                 <input type="range" min="5" max="300" value="10" class="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
                     oninput="document.getElementById('iVal').innerText = this.value"
                     onchange="fetch('/api/set-interval', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({seconds:parseInt(this.value)})})">
@@ -206,7 +215,7 @@ app.get('/', (req, res) => {
                 try {
                     const r = await fetch('/api/stats');
                     const d = await r.json();
-                    document.getElementById('sessionID').innerText = "Session: " + d.session;
+                    document.getElementById('sessionID').innerText = "Instance: " + d.session;
                     if (d.status === 'Active') {
                         document.getElementById('qrUI').classList.add('hidden');
                         document.getElementById('mainUI').classList.remove('hidden');
