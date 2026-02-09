@@ -10,11 +10,11 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// --- STORAGE ---
-const SESSION_FOLDER = "sessions/default"; 
-const HISTORY_FILE = "./posted_news.json";
+// --- STORAGE (Optimized for Render /tmp) ---
+const SESSION_FOLDER = "/tmp/sessions"; 
+const HISTORY_FILE = "/tmp/posted_news.json";
 
-if (!fs.existsSync("sessions")) fs.mkdirSync("sessions", { recursive: true });
+if (!fs.existsSync(SESSION_FOLDER)) fs.mkdirSync(SESSION_FOLDER, { recursive: true });
 if (!fs.existsSync(HISTORY_FILE)) fs.writeFileSync(HISTORY_FILE, JSON.stringify([]));
 
 // --- SETTINGS ---
@@ -31,16 +31,33 @@ let postIntervalTime = 10000;
 let postTimer;
 let intervalsStarted = false;
 
+// --- HELPERS ---
+function getHistory() {
+    try {
+        return JSON.parse(fs.readFileSync(HISTORY_FILE));
+    } catch (e) { return []; }
+}
+
+function saveToHistory(url) {
+    let history = getHistory();
+    if (!history.includes(url)) {
+        history.push(url);
+        if (history.length > 1000) history.shift();
+        fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
+    }
+}
+
 // --- CORE LOGIC ---
 async function scanNews() {
     if (!isBotActive) return;
     const yesterday = new Date();
     yesterday.setHours(yesterday.getHours() - 24);
     const url = `https://newsapi.org/v2/everything?q=world&from=${yesterday.toISOString().split('T')[0]}&sortBy=publishedAt&language=en&apiKey=${API_KEY}`;
+    
     try {
         const { data } = await axios.get(url);
         if (data.status !== "ok") return;
-        let history = JSON.parse(fs.readFileSync(HISTORY_FILE));
+        let history = getHistory();
         data.articles.forEach(article => {
             if (article.url && !history.includes(article.url) && !newsQueue.some(a => a.url === article.url)) {
                 newsQueue.push(article);
@@ -56,17 +73,17 @@ async function postFromQueue() {
     try {
         const message = `${header}\n\n📰 *${article.title.toUpperCase()}*\n\n${article.description || ""}\n\n🔗 ${article.url}\n\n📡 _Source: ${article.source.name}_`;
         await sock.sendMessage(CHANNEL_JID, { text: message });
-        
-        let history = JSON.parse(fs.readFileSync(HISTORY_FILE));
-        history.push(article.url);
-        fs.writeFileSync(HISTORY_FILE, JSON.stringify(history, null, 2));
-    } catch (err) { newsQueue.unshift(article); }
+        saveToHistory(article.url);
+    } catch (err) { 
+        console.error("Post Error:", err.message);
+        newsQueue.unshift(article); 
+    }
 }
 
-// --- API ---
+// --- API ROUTES ---
 app.get('/api/stats', (req, res) => {
     res.json({
-        posted: (JSON.parse(fs.readFileSync(HISTORY_FILE))).length,
+        posted: getHistory().length,
         queue: newsQueue.length,
         status: botStatus,
         isBotActive,
@@ -110,11 +127,12 @@ app.get('/', (req, res) => {
                 <p id="statusLabel" class="text-[10px] font-mono uppercase tracking-[0.3em] text-slate-500 mt-2">Connecting</p>
             </header>
 
-            <div id="qrBox" class="hidden stat-card p-6 rounded-[2.5rem] text-center mb-6">
-                <p class="text-[10px] font-black text-blue-400 mb-4 uppercase">Link WhatsApp</p>
+            <div id="qrBox" class="hidden stat-card p-6 rounded-[2.5rem] text-center mb-6 border-2 border-blue-500/20">
+                <p class="text-[10px] font-black text-blue-400 mb-4 uppercase tracking-widest text-center">Scan to Link</p>
                 <div class="bg-white p-2 rounded-xl inline-block mb-4 shadow-xl">
                     <img id="qrImg" class="w-48 h-48" />
                 </div>
+                <p class="text-[9px] text-slate-500 italic">Open WhatsApp > Linked Devices</p>
             </div>
 
             <div class="grid grid-cols-2 gap-4 mb-6">
@@ -130,7 +148,7 @@ app.get('/', (req, res) => {
 
             <div class="stat-card p-6 rounded-[2rem] mb-6">
                 <div class="flex justify-between items-center mb-4">
-                    <p class="text-slate-500 text-[10px] uppercase font-black tracking-widest">Interval</p>
+                    <p class="text-slate-500 text-[10px] uppercase font-black tracking-widest">Post Interval</p>
                     <span id="intervalVal" class="bg-blue-600 px-3 py-1 rounded-lg text-xs font-bold text-white">10s</span>
                 </div>
                 <input type="range" min="5" max="600" value="10" class="w-full h-2 bg-slate-800 rounded-lg appearance-none cursor-pointer"
@@ -180,7 +198,7 @@ async function startBot() {
         const { connection, qr, lastDisconnect } = update;
         
         if (qr) {
-            console.log("QR Generated - Sending to Dashboard");
+            console.log("QR Updated - Fetching DataURL");
             latestQR = await QRCode.toDataURL(qr); 
         }
         
@@ -204,4 +222,4 @@ async function startBot() {
 }
 
 startBot();
-app.listen(PORT, '0.0.0.0', () => console.log(`Watchdog PRO active on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Watchdog PRO online on port ${PORT}`));
